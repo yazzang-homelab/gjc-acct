@@ -87,6 +87,12 @@ gjc-acct                                    # 기본 계정(없으면 대화형 
   눌러 다른 계정 자격증명이 섞여 들어오지 않게 합니다. 슬롯 마커 파일의 mtime/size 가 바뀌었을
   때만 재임포트하므로 평소 실행 오버헤드는 없습니다.
 
+> ℹ️ **`codex-acct gjc-enable` 과의 관계.** `codex-acct` 에는 계정마다 gjc 커스텀 provider 를 만들고
+> `~/.gjc/agent/.env` 에 access token 을 평문으로 써 넣는 자체 연동(`gjc-enable`)이 있습니다.
+> gjc-acct 는 그 경로를 쓰지 않습니다 — 토큰은 계정별 `agent.db` 안에만 두고, 갱신 타이머 없이
+> 슬롯이 바뀔 때 공식 임포터로 다시 넣습니다. 둘을 같이 쓰면 같은 계정이 provider 목록에 중복으로
+> 보일 수 있으니, gjc-acct 로 넘어왔다면 `codex-acct gjc-disable <name>` 로 정리하십시오.
+
 ### 계정과 슬롯 바인딩
 
 계정 이름과 같은 이름의 슬롯이 있으면 **자동으로** 묶입니다(`lee` → `claude=lee`).
