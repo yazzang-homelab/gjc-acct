@@ -1,0 +1,21 @@
+# 절대 커밋 금지 — 자격증명/계정 데이터
+.claude-accounts/
+.gjc-accounts/
+**/.credentials.json
+**/auth.json
+**/.codex-accounts/
+**/agent.db
+**/agent.db-*
+**/.env
+**/.env.*
+*.key
+*.pem
+*.token
+
+# 로컬 산출물
+__pycache__/
+*.log
+*.bak
+
+# 코딩 에이전트 세션 아티팩트
+.gjc/
