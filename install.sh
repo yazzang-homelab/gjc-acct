@@ -78,4 +78,7 @@ cat <<'NEXT'
   gjc-acct work               # 그 계정으로 gjc 실행
   gjc-acct list               # 계정/인증/격리저장소 상태
   gjc-acct default work       # 무인자 실행 기본 계정 설정
+
+프로젝트가 도움이 됐다면 GitHub에서 Star로 응원해 주세요(선택):
+  https://github.com/yazzang-homelab/gjc-acct
 NEXT
