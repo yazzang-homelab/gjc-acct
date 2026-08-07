@@ -1,6 +1,9 @@
 # gjc-acct
 
 [English](README.md) | [한국어](README.ko.md)
+<p align="center">
+  <img src="KakaoTalk_20260807_194921929.png" alt="gjc-acct 계정 전환기" width="720">
+</p>
 
 여러 개의 구독 계정/좌석을 **[Gajae-Code](https://github.com/Yeachan-Heo/gajae-code) (`gjc`)** 에서
 이름으로 골라 실행하는 작은 런처입니다.

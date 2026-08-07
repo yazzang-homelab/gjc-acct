@@ -1,6 +1,9 @@
 # gjc-acct
 
 [English](README.md) | [한국어](README.ko.md)
+<p align="center">
+  <img src="KakaoTalk_20260807_194921929.png" alt="gjc-acct account switcher" width="720">
+</p>
 
 A small launcher for selecting named subscription accounts in
 **[Gajae-Code](https://github.com/Yeachan-Heo/gajae-code) (`gjc`)**.
