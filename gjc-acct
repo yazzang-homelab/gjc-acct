@@ -1,91 +1,89 @@
 #!/usr/bin/env bash
 #
-# gjc-acct — 여러 구독 계정/좌석을 gjc(Gajae Code)에서 이름으로 골라 쓰는 런처.
-#
-# 위치:
-#   자매 도구들이 "로그인 슬롯"을 만들어 두면, gjc-acct 는 그 슬롯들을 gjc 쪽으로 이어 붙인다.
-#     claude-acct  →  ~/.claude-accounts/<slot>   (Claude 구독/팀좌석)
-#     codex-acct   →  ~/.codex-accounts/<slot>    (ChatGPT/Codex 계정)
-#     (그 외 소스는 GJC_ACCT_EXTRA_SOURCES 로 추가)
-#   gjc-acct 는 로그인을 직접 하지 않는다. 슬롯 관리는 각 자매 도구 몫이고, 여기서는
-#   "어떤 슬롯 조합으로 gjc 를 띄울 것인가"만 정한다.
+# gjc-acct — claude-acct 로 로그인해 둔 여러 Claude 구독 계정/팀좌석을 gjc(Gajae Code)에서 골라 쓰는 런처.
 #
 # 핵심 설계(격리형):
 #   * 계정마다 독립된 gjc 저장소 디렉터리를 쓴다:  ~/.gjc-accounts/<name>/agent  (GJC_CODING_AGENT_DIR).
-#     - agent.db(자격증명)만 계정별로 분리 → 같은 이메일이 두 좌석이어도 서로 덮어쓰지 않는다.
-#     - config.yml/models.yml/mcp.json/skills/commands 등은 base(~/.gjc/agent)와 심링크 공유
-#       → 설정·스킬은 어느 계정에서든 동일. 오직 "누구로 로그인했나"만 계정별로 갈린다.
-#   * 자격증명 주입은 gjc 의 공식 임포터로만 한다:
-#       GJC_CODING_AGENT_DIR=<store> CLAUDE_CONFIG_DIR=<slot> CODEX_HOME=<slot> gjc setup credentials --yes
-#     슬롯이 곧 단일 원본이고, 슬롯 파일이 바뀐 경우에만 재임포트한다.
-#   * 한도는 좌석 단위다. 슬롯을 좌석별로 두면 각각 독립적으로 잡힌다.
+#     - agent.db(자격증명)만 계정별로 분리 → 같은 이메일이 두 팀좌석이어도 서로 덮어쓰지 않는다.
+#     - models.yml/mcp.json/skills/commands/notifications 등은 base(~/.gjc/agent)와 심링크 공유.
+#     - config.yml/settings.json 은 계정별 실파일이다(없을 때만 base 에서 시드).
+#       gjc 가 이 파일을 임시파일+rename 으로 원자적 교체하므로 심링크가 첫 쓰기에서 풀린다.
+#       공유되는 척하다 조용히 갈라지는 대신 계정 소유로 명시한다 → 계정별 모델 역할·알림 설정이 유지된다.
+#   * Claude 토큰은 claude-acct 슬롯(~/.claude-accounts/<name>/.credentials.json)을 단일 원본으로 삼아
+#     실행 때마다 해당 계정 agent.db 로 동기화한다(복사 아님·재로그인 불필요). 슬롯이 갱신하면 자동 반영.
+#   * 한도는 팀좌석 단위다. org(팀)가 다르면 좌석 한도가 따로 잡히므로, 슬롯을 좌석별로 두면 각각 독립적으로 쓴다.
 #
 # 사용법:
 #   gjc-acct                      기본 계정으로 gjc 실행(없으면 대화형 선택)
 #   gjc-acct <name> [args…]       지정 계정으로 gjc 실행 (나머지 인자는 gjc 로 전달)
-#   gjc-acct list|ls              계정 목록 + 소스별 인증/격리저장소 상태
-#   gjc-acct status               계정별 소스·이메일·구독/한도tier 개요
-#   gjc-acct sources              등록된 슬롯 소스와 탐지된 슬롯 목록
-#   gjc-acct bind <name> <src>=<slot> [...]   계정에 슬롯 수동 바인딩 (예: bind work claude=lee codex=2)
-#   gjc-acct unbind <name> <src>  바인딩 해제
-#   gjc-acct sync <name>          슬롯 → 계정 저장소 동기화만(실행 안 함)
-#   gjc-acct reseed <name>        계정 저장소를 base 기준으로 재시드
+#   gjc-acct list|ls              계정 목록 + 인증/격리저장소 상태
+#   gjc-acct status               계정별 이메일/구독/한도tier 개요
+#   gjc-acct sync <name>          슬롯 토큰을 해당 계정 저장소로 동기화만(실행 안 함, 최신 우선)
+#   gjc-acct writeback <name>     계정 저장소의 로테이션된 토큰을 슬롯으로 되쓰기(실행 안 함)
+#   gjc-acct reseed <name>        계정 저장소를 base 기준으로 재시드(심링크·공용 provider 자격증명 갱신)
 #   gjc-acct default [name]       무인자 실행 시 쓸 기본 계정 조회/설정
 #   gjc-acct dir <name>           계정 저장소 경로 출력
 #   gjc-acct completion bash|zsh  셸 자동완성 스크립트 출력
 #
 set -euo pipefail
 
+CLAUDE_ACCOUNTS="${CLAUDE_ACCOUNTS_DIR:-$HOME/.claude-accounts}"
 BASE_AGENT="${GJC_BASE_AGENT_DIR:-$HOME/.gjc/agent}"
 ACCT_ROOT="${GJC_ACCOUNTS_DIR:-$HOME/.gjc-accounts}"
-GJC_BIN="${GJC_ACCT_BIN:-gjc}"
 DEFAULT_FILE="$ACCT_ROOT/.default"
 
-# ── 슬롯 소스 레지스트리 ─────────────────────────────────────────────────────
-#   형식:  key|슬롯루트|gjc가 읽는 env 변수|인증 마커 파일|gjc provider id|자매 도구
-#   env 변수와 provider id 는 gjc 가 공식 지원하는 것만 쓴다
-#   (src/setup/credential-import.ts: $CLAUDE_CONFIG_DIR/.credentials.json, $CODEX_HOME/auth.json).
-#   새 소스는 gjc 가 그 소스를 임포트할 수 있게 된 뒤에 추가한다.
-SOURCES=(
-  "claude|${CLAUDE_ACCOUNTS_DIR:-$HOME/.claude-accounts}|CLAUDE_CONFIG_DIR|.credentials.json|anthropic|claude-acct"
-  "codex|${CODEX_ACCOUNTS_DIR:-$HOME/.codex-accounts}|CODEX_HOME|auth.json|openai-codex|codex-acct"
-)
-# 추가 소스: 같은 형식의 줄을 개행 또는 ';' 으로 이어 붙인다.
-if [[ -n "${GJC_ACCT_EXTRA_SOURCES:-}" ]]; then
-  while IFS= read -r _line; do
-    [[ -n "$_line" ]] && SOURCES+=("$_line")
-  done < <(printf '%s' "${GJC_ACCT_EXTRA_SOURCES//;/$'\n'}")
-fi
+# 이 스크립트로의 심링크 이름이 gjc 면 "래퍼 모드"로 동작한다.
+#   gjc  →  /usr/local/bin/gjc-acct  (심링크)
+# 래퍼 모드에서는 인자를 계정 이름으로 해석하지 않는다. 기본 계정(gjc-acct default <name>)으로
+# 라우팅하고 인자는 전부 실 gjc 로 넘긴다 — `gjc -p ...`·`gjc session ...` 이 그대로 동작해야 한다.
+# 계정을 명시해 고르는 경로는 여전히 `gjc-acct <name>` 이다.
+SELF_NAME="$(basename -- "$0")"
+WRAPPER_MODE=0
+case "$SELF_NAME" in gjc|gjc.exe) WRAPPER_MODE=1 ;; esac
 
-src_field() { printf '%s' "$1" | cut -d'|' -f"$2"; }
-src_key()      { src_field "$1" 1; }
-src_root()     { src_field "$1" 2; }
-src_env()      { src_field "$1" 3; }
-src_marker()   { src_field "$1" 4; }
-src_provider() { src_field "$1" 5; }
-src_tool()     { src_field "$1" 6; }
-
-src_by_key() {
-  local s
-  for s in "${SOURCES[@]}"; do [[ "$(src_key "$s")" == "$1" ]] && { printf '%s' "$s"; return 0; }; done
+# 실 gjc 바이너리 해소. PATH 의 `gjc` 는 래퍼(=이 스크립트)일 수 있으므로 절대 그대로 쓰지 않는다.
+# 후보를 realpath 로 비교해 자기 자신이면 건너뛴다(무한 재귀 방지).
+SELF_REAL="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
+resolve_gjc_bin() {
+  local c p
+  for c in "${GJC_ACCT_BIN:-}" "$HOME/.bun/bin/gjc-real" \
+           "$HOME/.bun/install/global/node_modules/@gajae-code/coding-agent/bin/gjc.js" \
+           "$(command -v gjc-real 2>/dev/null || true)" \
+           "$(command -v gjc 2>/dev/null || true)"; do
+    [[ -n "$c" ]] || continue
+    p="$(readlink -f "$c" 2>/dev/null || printf '%s' "$c")"
+    [[ -x "$p" ]] || continue
+    [[ "$p" == "$SELF_REAL" ]] && continue
+    printf '%s' "$c"; return 0
+  done
   return 1
 }
+GJC_BIN="$(resolve_gjc_bin || true)"
+if [[ -z "$GJC_BIN" ]]; then
+  printf '\033[31m%s\033[0m\n' "실 gjc 바이너리를 찾지 못함 — GJC_ACCT_BIN 을 지정하라" >&2; exit 127
+fi
 
-# Windows Git-Bash(MSYS): python3 UTF-8 출력 보장(PYTHONUTF8).
+# Windows Git-Bash(MSYS): python3 UTF-8 출력 보장(PYTHONUTF8). 심링크 모드는 레거시 잔재.
 case "$(uname -s 2>/dev/null)" in MINGW*|MSYS*) export MSYS=winsymlinks:nativestrict PYTHONUTF8=1 ;; esac
 
 # 세션 공유 전략(크로스플랫폼):
-#   계정 간 세션 공유는 심링크로 하지 않는다. gjc 의 관리형 세션 스코프는 sessions 루트가
-#   심링크/junction(=reparse point)이면 정당하게 거부한다(managed-session-scope.ts).
+#   계정 간 세션 공유는 심링크로 하지 않는다. gjc 0.11+ 의 관리형 세션 스코프는
+#   sessions 루트가 심링크/junction(=reparse point)이면 거부한다
+#   ("The sessions root is not a safe directory"; managed-session-scope.ts).
 #   Windows(MSYS)에선 애초에 `ln -s` 가 복사본을 만들어 공유도 안 된다.
-#   대신 런치 때 `--session-dir <공유경로>` 를 주입한다. 업스트림이 오퍼레이터 오버라이드로
-#   열어 둔 경로다(docs/session.md: "Explicit --session-dir remains an operator-selected override").
-#
-#   한계(gjc 0.12+): 이 경로는 계정끼리만 공유되고 계정 미지정 맨 gjc 와는 공유되지 않는다.
-#   0.12 의 기본 세션 디렉터리는 sessions/v2-<digest> 이고 아래 이름 규칙은 그것과 다르다.
-#   또한 명시 경로 실행은 관리형 스코프의 ACL·no-follow 검증 밖에 놓인다(보안 한 단계 하향).
-#   GJC_ACCT_NO_SESSION_SHARE=1 이면 주입하지 않고 gjc 기본 관리형 스코프를 그대로 쓴다.
+#   대신 런치 때 `--session-dir <공유경로>` 를 주입한다. 이 explicit 목적지는
+#   관리형 안전검사를 우회하며(session-manager.ts destinationFor→explicitDestination),
+#   Linux/macOS/Windows 모두에서 동일하게 동작한다. agent.db(자격증명)만 계정별 격리.
+#   핵심: 주입하는 경로는 gjc 가 그 cwd 에서 기본으로 쓰는 세션 디렉터리와 "같은 이름"이다
+#   (SHARED_SESSIONS_ROOT == gjc 기본 sessions 루트 && gjc_default_session_dirname()).
+#   그래서 맨 gjc(계정 미지정)와 모든 계정이 cwd 별로 단 하나의 세션 히스토리를 공유한다.
 SHARED_SESSIONS_ROOT="${GJC_ACCT_SESSIONS_ROOT:-$BASE_AGENT/sessions}"
+
+# base agent.db 에서 계정 저장소로 복사할 때 제외(격리)할 파일 / 심링크 공유하지 않을 패턴
+#   - agent.db*        : 자격증명 = 계정별 격리
+#   - models.db*       : 모델 카탈로그 캐시 = 계정별 자동 재생성
+#   - *-shm/-wal/.lock : sqlite 부산물·락 = 공유 금지
+#   - credential-auto-import-state.json : 계정별
 
 err()  { printf '\033[31m%s\033[0m\n' "$*" >&2; }
 info() { printf '\033[36m%s\033[0m\n' "$*" >&2; }
@@ -94,114 +92,39 @@ ok()   { printf '\033[32m%s\033[0m\n' "$*" >&2; }
 # gjc.exe(네이티브)로 넘길 경로를 OS 네이티브 형식으로. Git-Bash 에선 cygpath -m 로 변환.
 to_native() { if command -v cygpath >/dev/null 2>&1; then cygpath -m "$1"; else printf '%s' "$1"; fi; }
 
-valid_name() { [[ "$1" =~ ^[A-Za-z0-9._-]+$ ]] || { err "잘못된 이름: '$1'"; exit 1; }; }
+valid_name() { [[ "$1" =~ ^[A-Za-z0-9._-]+$ ]] || { err "잘못된 계정 이름: '$1'"; exit 1; }; }
+slot_dir()   { printf '%s/%s' "$CLAUDE_ACCOUNTS" "$1"; }
 acct_dir()   { printf '%s/%s/agent' "$ACCT_ROOT" "$1"; }
-bind_file()  { printf '%s/%s/sources' "$ACCT_ROOT" "$1"; }
-
-slot_dir()    { printf '%s/%s' "$(src_root "$1")" "$2"; }                      # <source-spec> <slot>
-slot_authed() { [[ -f "$(slot_dir "$1" "$2")/$(src_marker "$1")" ]]; }
-
-# ── 바인딩: 계정 이름 → 소스별 슬롯 ─────────────────────────────────────────
-#   파일이 없으면 "같은 이름의 슬롯이 있는 모든 소스" 로 자동 바인딩한다.
-#   bindings_for <name> → "key<TAB>slot" 줄들
-bindings_for() {
-  local name="$1" bf; bf="$(bind_file "$name")"
-  if [[ -f "$bf" ]]; then
-    local line k v
-    while IFS= read -r line; do
-      [[ -z "$line" || "$line" == \#* ]] && continue
-      k="${line%%=*}"; v="${line#*=}"
-      [[ -n "$k" && -n "$v" ]] && src_by_key "$k" >/dev/null 2>&1 && printf '%s\t%s\n' "$k" "$v"
-    done < "$bf"
-    return 0
-  fi
-  local s
-  for s in "${SOURCES[@]}"; do
-    [[ -d "$(slot_dir "$s" "$name")" ]] && printf '%s\t%s\n' "$(src_key "$s")" "$name"
-  done
-}
-
-bind_cmd() {
-  local name="${1:-}"; shift || true
-  [[ -n "$name" ]] || { err "사용법: gjc-acct bind <name> <source>=<slot> [...]"; exit 1; }
-  valid_name "$name"
-  [[ $# -gt 0 ]] || { err "바인딩할 <source>=<slot> 을 하나 이상 주십시오."; exit 1; }
-  local bf; bf="$(bind_file "$name")"; mkdir -p "$(dirname "$bf")"
-  local pair k v s existing=""
-  [[ -f "$bf" ]] && existing="$(cat "$bf")"
-  for pair in "$@"; do
-    k="${pair%%=*}"; v="${pair#*=}"
-    [[ "$pair" == *=* && -n "$k" && -n "$v" ]] || { err "형식: <source>=<slot> (받은 값: '$pair')"; exit 1; }
-    valid_name "$v"
-    s="$(src_by_key "$k")" || { err "모르는 소스: '$k' (gjc-acct sources 로 확인)"; exit 1; }
-    [[ -d "$(slot_dir "$s" "$v")" ]] || { err "없는 슬롯: $k=$v → $(slot_dir "$s" "$v")"; exit 1; }
-    existing="$(printf '%s\n' "$existing" | grep -v "^${k}=" || true)"
-    existing="$(printf '%s\n%s=%s' "$existing" "$k" "$v")"
-  done
-  printf '%s\n' "$existing" | grep -v '^$' > "$bf"
-  ok "바인딩 저장: $name"; sed 's/^/  /' "$bf" >&2
-}
-
-unbind_cmd() {
-  local name="${1:-}" key="${2:-}"
-  [[ -n "$name" && -n "$key" ]] || { err "사용법: gjc-acct unbind <name> <source>"; exit 1; }
-  valid_name "$name"
-  local bf; bf="$(bind_file "$name")"
-  [[ -f "$bf" ]] || { err "바인딩 파일 없음(자동 바인딩 상태): $name"; exit 1; }
-  grep -v "^${key}=" "$bf" > "$bf.tmp" && mv "$bf.tmp" "$bf"
-  ok "바인딩 해제: $name / $key"
-}
-
-# 계정 후보 = 모든 소스의 슬롯 이름 ∪ 이미 만들어진 계정 디렉터리
-all_account_names() {
-  { local s d
-    for s in "${SOURCES[@]}"; do
-      for d in "$(src_root "$s")"/*/; do [[ -d "$d" ]] && basename "$d"; done 2>/dev/null
-    done
-    for d in "$ACCT_ROOT"/*/; do [[ -d "$d/agent" ]] && basename "$d"; done 2>/dev/null
-  } | sort -u
-}
-
-account_exists() { [[ -n "$(bindings_for "$1")" || -d "$(acct_dir "$1")" ]]; }
-
-# 계정의 대표 표시 이름(첫 번째 바인딩된 소스의 이메일).
-account_identity() {
-  local name="$1" line k v s email out=""
-  while IFS=$'\t' read -r k v; do
-    [[ -z "$k" ]] && continue
-    s="$(src_by_key "$k")" || continue
-    email="$(slot_email "$s" "$v")"
-    [[ -n "$email" ]] && out="${out:+$out, }$k:$email" || out="${out:+$out, }$k:$v"
-  done < <(bindings_for "$name")
-  printf '%s' "$out"
-}
-
-# 소스별 이메일 추출.
-slot_email() {
-  local s="$1" slot="$2" p; p="$(slot_dir "$s" "$slot")"
-  case "$(src_key "$s")" in
-    claude)
-      python3 - "$p/.claude.json" <<'PY' 2>/dev/null || true
+# 슬롯이 "실제로" 인증돼 있는지: 파일 존재만으로는 부족(로그아웃 시 토큰이 빈 문자열로 남는다).
+has_creds()  {
+  local f; f="$(slot_dir "$1")/.credentials.json"
+  [[ -f "$f" ]] || return 1
+  python3 - "$f" <<'PY'
 import json,sys
-try: print((json.load(open(sys.argv[1])).get("oauthAccount") or {}).get("emailAddress","") or "")
-except Exception: print("")
-PY
-      ;;
-    codex)
-      python3 - "$p/auth.json" <<'PY' 2>/dev/null || true
-import base64,json,sys
 try:
-    tok=(json.load(open(sys.argv[1])).get("tokens") or {}).get("id_token") or ""
-    part=tok.split(".")[1]; part+="="*(-len(part)%4)
-    print(json.loads(base64.urlsafe_b64decode(part)).get("email","") or "")
-except Exception: print("")
+    o = json.load(open(sys.argv[1])).get("claudeAiOauth") or {}
+except Exception:
+    sys.exit(1)
+sys.exit(0 if (o.get("accessToken") or o.get("refreshToken")) else 1)
 PY
-      ;;
-    *) printf '' ;;
-  esac
 }
 
-# ── 세션 디렉터리 ────────────────────────────────────────────────────────────
+slot_email() {
+  python3 - "$(slot_dir "$1")/.claude.json" <<'PY' 2>/dev/null || true
+import json,sys
+try:
+    print((json.load(open(sys.argv[1])).get("oauthAccount") or {}).get("emailAddress","") or "")
+except Exception:
+    print("")
+PY
+}
+
+# gjc 가 특정 cwd 에 대해 기본으로 쓰는 세션 디렉터리 이름을 그대로 재현한다.
+#   (session-manager.ts getDefaultSessionDirName)
+#     - cwd 가 HOME 아래면      "-<home기준 상대경로>"        (예: /root/tmp → -tmp)
+#     - cwd 가 tmpdir 아래면    "-tmp-<tmp기준 상대경로>"     (예: /tmp/foo → -tmp-foo)
+#     - 그 외 절대경로면        "--<슬래시를 - 로 치환>--"
+#   구분자(/ \ :)는 모두 - 로 치환. HOME==cwd 는 "-", tmpdir==cwd 는 "-tmp".
 gjc_default_session_dirname() {
   local cwd home tmp rel
   cwd="$(cd "$1" 2>/dev/null && pwd -P || printf '%s' "$1")"
@@ -220,14 +143,35 @@ gjc_default_session_dirname() {
   fi
 }
 
+# 현재 cwd 에 대응하는 공유 세션 디렉터리 경로.
+#   gjc 의 기본 세션 디렉터리 이름을 그대로 쓰므로, 맨 gjc(계정 미지정)·모든 계정이
+#   같은 cwd 에서 단 하나의 세션 히스토리를 공유한다(= 완전 동기화). 계정 무관·결정적.
 session_dir_for_cwd() {
-  local cwd; cwd="$(pwd -P 2>/dev/null || pwd)"
+  local cwd
+  cwd="$(pwd -P 2>/dev/null || pwd)"
   printf '%s/%s' "$SHARED_SESSIONS_ROOT" "$(gjc_default_session_dirname "$cwd")"
 }
 
+# 구버전이 만든 acct-<base>-<cksum> 세션 디렉터리를 통합 경로로 1회성 병합(현재 cwd 한정, 베스트에포트).
+migrate_legacy_acct_session_dir() {
+  local unified="$1" cwd h base legacy
+  cwd="$(pwd -P 2>/dev/null || pwd)"
+  h="$(printf '%s' "$cwd" | cksum | cut -d' ' -f1)"
+  base="$(basename "$cwd")"; base="${base//[^A-Za-z0-9._-]/-}"
+  legacy="$SHARED_SESSIONS_ROOT/acct-$base-$h"
+  [[ "$legacy" == "$unified" ]] && return 0
+  [[ -d "$legacy" ]] || return 0
+  mkdir -p "$unified" 2>/dev/null || true
+  cp -rn "$legacy"/. "$unified"/ 2>/dev/null || true
+  rm -rf "$legacy" 2>/dev/null || true
+  info "레거시 계정 세션 디렉터리 병합: $legacy → $unified"
+}
+
+# 세션을 여는 실행일 때만 --session-dir 를 주입한다.
+#   관리 서브커맨드(session/state/stats/...)나 이미 --session-dir/--no-session 이
+#   있으면 주입하지 않는다(서브커맨드 인자 파싱 충돌 방지).
 should_inject_sessiondir() {
   local a
-  [[ -n "${GJC_ACCT_NO_SESSION_SHARE:-}" ]] && return 1
   for a in "$@"; do
     case "$a" in
       --session-dir|--session-dir=*|--no-session) return 1 ;;
@@ -240,28 +184,108 @@ should_inject_sessiondir() {
   return 0
 }
 
-# ── 계정 저장소 ──────────────────────────────────────────────────────────────
-# base 의 항목을 계정 저장소로 심링크(격리 대상은 제외).
+# 공유 심링크 깔기: base 의 항목을 계정 저장소로 심링크(격리 대상은 제외).
+#
+# gjc 가 원자적 교체(임시파일+rename)로 다시 쓰는 파일은 심링크로 공유할 수 없다.
+# applyAtomicYamlPatches 는 심링크를 따라가지 않고 그 경로를 실파일로 갈아치우므로,
+# 첫 설정 변경에서 심링크가 사라지고 계정별 실파일로 갈라진다(실측: jung/lee/lee2 는
+# 이미 실파일, 한 번도 쓴 적 없는 kuk 만 심링크로 남아 있었다). 공유를 유지하는 척하다
+# 조용히 갈라지는 대신, 이런 파일은 애초에 계정별 실파일로 두고 없을 때만 base 에서 시드한다.
+ATOMIC_OWNED_FILES=(config.yml settings.json)
+
+# 심링크로 두면 gjc 가 아예 못 읽는 파일: agent/.env 는 utils/env.ts 의 readTrustedAgentEnv()
+# 가 lstat().isFile() + O_NOFOLLOW 로 열기 때문에 심링크면 status=unavailable 이 되고,
+# $rotatingCredentialEnv() 가 그 파일이 소유한 이름(CLAUDE_TOKEN_*·CODEX_TOKEN_*)을
+# 무조건 undefined 로 만든다 → models.yml 의 apiKeyEnv 프로바이더가 통째로 사라진다
+# (실측 2026-08-21, gjc 0.14.2: 5계정 전부 claude-*·codex-* 레인 소멸, agy 처럼
+# 인라인 apiKey 를 쓰는 프로바이더만 살아남았다). 매 호출마다 base 내용을 실파일로 미러링한다.
+TRUSTED_REAL_FILES=(.env)
+
+mirror_trusted_files() {
+  local adir="$1" name dst src
+  for name in "${TRUSTED_REAL_FILES[@]}"; do
+    dst="$adir/$name"; src="$BASE_AGENT/$name"
+    [[ -f "$src" ]] || continue
+    [[ -L "$dst" ]] && rm -f "$dst"
+    if ! cmp -s "$src" "$dst" 2>/dev/null; then
+      cp -p "$src" "$dst.tmp.$$" && chmod 600 "$dst.tmp.$$" && mv -f "$dst.tmp.$$" "$dst"
+    fi
+    chmod 600 "$dst" 2>/dev/null || true
+  done
+}
+
+# 계정이 소유하는 설정 파일 보장: 없으면 base 에서 복사, 심링크면 그 내용을 실파일로 고정.
+# 이미 갈라진 실파일은 절대 건드리지 않는다(그 안에 계정별 모델·알림 설정이 들어 있다).
+own_atomic_files() {
+  local adir="$1" name dst src
+  for name in "${ATOMIC_OWNED_FILES[@]}"; do
+    dst="$adir/$name"; src="$BASE_AGENT/$name"
+    if [[ -L "$dst" ]]; then
+      local target; target="$(readlink -f "$dst" 2>/dev/null || true)"
+      if [[ -f "$target" ]]; then cp -p "$target" "$dst.tmp.$$" && mv -f "$dst.tmp.$$" "$dst"
+      else rm -f "$dst"; fi
+    elif [[ ! -e "$dst" && -f "$src" ]]; then
+      cp -p "$src" "$dst"
+    fi
+  done
+}
+
 link_shared() {
   local adir="$1" f name dst
   mkdir -p "$adir"; chmod 700 "$adir" 2>/dev/null || true
+  # 세션은 심링크로 공유하지 않는다(위 전략 주석 참고). 공유 세션 루트만 실디렉터리로 보장.
   mkdir -p "$SHARED_SESSIONS_ROOT" 2>/dev/null || true
+  # 이전 버전이 만든 sessions/terminal-sessions 심링크가 남아 있으면 제거(이제 --session-dir 사용).
+  # resident-cache 도 심링크로 두면 안 된다: gjc 의 blob-store 는 이 루트를 lstat 으로
+  # 검증해 심링크면 ResidentCacheTrustError(directory_untrusted) 로 실패한다(리다이렉트/TOCTOU 방어).
+  # 쓰기 경로는 메모리로 강등되지만 fork/setSessionFile/restoreState 는 하드 실패한다.
+  # 애초에 인스턴스 디렉터리는 PID 리스로 소유되는 프로세스 로컬 캐시라 공유 이득이 없다.
+  # .gjc-recovery 도 같은 이유로 실디렉터리여야 한다: 네이티브 RecoveryFsRoot 는 관리
+  # 세션 스코프를 retain 할 때 이 저널 루트가 심링크면 reparse_point 를 던지고, TS 층이
+  # 이를 binding_invalid: prepare:retained_authority 로 감싸 비대화(-p) 실행이 통째로
+  # 크래시한다(실측: kuk/lee/jung/mjlee/drtechmes 5계정). 계정별 실디렉터리로 시드한다.
+  # sdk 도 같은 부류다: 네이티브 RetainedPublication::open 은 agent_dir/sdk ·
+  # sdk/broker.lock · sdk/broker.lock/owner.json · sdk/broker.json 을 전부
+  # O_NOFOLLOW 로 열어 신원을 확인하므로(pi-natives path_identity.rs 의 publication
+  # 모듈), sdk 가 심링크면 Option::None 이 되고 napi 가 GenericFailure
+  # "Retained broker publication authority is unavailable." 를 던진다. TS 층
+  # publishBrokerDiscovery 는 이를 감싸지 않아 브로커 기동이 uncaught 로 죽는다.
+  # 실측(2026-08-19): 5계정 sdk 가 /root/.gjc/agent/sdk 심링크였고 하루 11회 크래시.
+  # 격리 재현: 실디렉터리 sdk 는 PUBLISH OK(observe=owned), 심링크 sdk 만 위 에러.
+  # 브로커 publication 은 애초에 agent 디렉터리 소유 자원이라 계정 간 공유 이득이 없다.
   local sd
-  for sd in sessions terminal-sessions; do
+  for sd in sessions terminal-sessions resident-cache .gjc-recovery sdk; do
     [[ -L "$adir/$sd" ]] && rm -f "$adir/$sd"
   done
+  mkdir -p "$adir/sdk" 2>/dev/null || true
+  chmod 700 "$adir/sdk" 2>/dev/null || true
+  mkdir -p "$adir/resident-cache" 2>/dev/null || true
+  chmod 700 "$adir/resident-cache" 2>/dev/null || true
+  mkdir -p "$adir/.gjc-recovery" 2>/dev/null || true
+  chmod 700 "$adir/.gjc-recovery" 2>/dev/null || true
   for f in "$BASE_AGENT"/* "$BASE_AGENT"/.[!.]*; do
     [[ -e "$f" ]] || continue
     name="$(basename "$f")"
     case "$name" in
       agent.db|agent.db-*|models.db|models.db-*|*-shm|*-wal|*.lock|credential-auto-import-state.json) continue ;;
-      sessions|terminal-sessions) continue ;;
+      sessions|terminal-sessions|resident-cache|.gjc-recovery|sdk) continue ;;
+      .env) continue ;;   # mirror_trusted_files() 가 실파일로 미러링(심링크면 gjc 가 못 읽는다)
     esac
+    # gjc 가 원자적으로 갈아치우는 설정 파일은 계정 소유다. 심링크로 덮으면 첫 쓰기에서
+    # 어차피 풀리고, 아래 병합 분기가 이미 갈라진 계정 설정을 rm -rf 로 날려 base 로
+    # 되돌린다(모델 역할·알림 토큰 손실). own_atomic_files() 가 대신 처리한다.
+    local owned=0 owned_name
+    for owned_name in "${ATOMIC_OWNED_FILES[@]}"; do
+      [[ "$name" == "$owned_name" ]] && owned=1
+    done
+    (( owned )) && continue
     dst="$adir/$name"
     if [[ -L "$dst" ]]; then
       [[ "$(readlink -f "$dst" 2>/dev/null)" == "$(readlink -f "$f" 2>/dev/null)" ]] && continue
       rm -f "$dst"
     elif [[ -e "$dst" ]]; then
+      # 계정 저장소가 base 와 갈라진 실파일/실디렉터리 → base 로 병합 후 심링크로 통일
+      # (세션/터미널세션/config 등이 계정별로 분기되는 것을 막고 로컬 안에서 하나로 묶는다)
       if [[ -d "$dst" && -d "$f" ]]; then
         cp -rn "$dst"/. "$f"/ 2>/dev/null || true
         rm -rf "$dst"
@@ -275,191 +299,184 @@ link_shared() {
   done
 }
 
-# 계정 저장소에 특정 provider 자격증명이 있는지.
-has_provider() {
-  local adir="$1" prov="$2"
-  [[ -f "$adir/agent.db" ]] || return 1
-  DB="$adir/agent.db" PROV="$prov" python3 - <<'PY' 2>/dev/null
-import os,sqlite3,sys
-try:
-    c=sqlite3.connect(os.environ["DB"], timeout=5)
-    row=c.execute("select 1 from auth_credentials where provider=?",(os.environ["PROV"],)).fetchone()
-    sys.exit(0 if row else 1)
-except Exception: sys.exit(1)
-PY
-}
-
-# 계정 저장소에서 provider 자격증명 제거.
-#   1순위: 업스트림 공식 CLI `gjc auth-broker logout <provider>`.
-#   2순위: 직접 DELETE. gjc 0.12.12 에서 auth-broker 는 cli.ts 커맨드 레지스트리에 등록돼 있지 않아
-#          argv 가 채팅 프롬프트로 흘러가 버린다(무한 대기, 자격증명이 있으면 무관한 404).
-#          업스트림 이슈: Yeachan-Heo/gajae-code#3975. 등록되면 1순위가 성공하고 이 폴백은 죽는다.
-#          내부 스키마에 기대는 유일한 지점이며, 깨지면 이 저장소 책임이다(NOTICE.md).
-drop_provider() {
-  local adir="$1" prov="$2"
-  [[ -f "$adir/agent.db" ]] || return 0
-  has_provider "$adir" "$prov" || return 0
-  local broken="$ACCT_ROOT/.logout-cli-broken"
-  if [[ ! -f "$broken" ]]; then
-    if GJC_CODING_AGENT_DIR="$(to_native "$adir")" timeout 10 "$GJC_BIN" auth-broker logout "$prov" >/dev/null 2>&1 \
-       && ! has_provider "$adir" "$prov"; then
-      return 0
-    fi
-    printf '%s\n' "$("$GJC_BIN" --version 2>/dev/null || echo unknown)" > "$broken" 2>/dev/null || true
-  fi
-  DB="$adir/agent.db" PROV="$prov" python3 - <<'PY'
-import os,sqlite3
-c=sqlite3.connect(os.environ["DB"], timeout=15); c.execute("PRAGMA busy_timeout=15000")
-c.execute("delete from auth_credentials where provider=?", (os.environ["PROV"],))
-c.commit(); c.close()
-PY
-}
-
-# 계정 agent.db 시드: base 를 일관 복사한 뒤, 이 계정이 바인딩한 소스의 provider 만 비운다.
-#   (바인딩하지 않은 provider 는 base 것을 그대로 상속 — 공용 자격증명은 유지)
+# 계정 agent.db 시드: base 자격증명을 일관 복사 후 anthropic 행 제거(계정별 로그인/동기화로 채움).
 seed_agent_db() {
-  local name="$1" adir; adir="$(acct_dir "$name")"
+  local adir="$1"
   [[ -f "$adir/agent.db" ]] && return 0
   BASE_DB="$BASE_AGENT/agent.db" DST_DB="$adir/agent.db" python3 - <<'PY'
 import os,sqlite3
 src=os.environ["BASE_DB"]; dst=os.environ["DST_DB"]
 s=sqlite3.connect(src, timeout=15); d=sqlite3.connect(dst, timeout=15)
-s.backup(d)            # sqlite 공개 API 만 사용(스키마 지식 없음). 공용 provider 자격증명 상속.
-s.close(); d.close()
+s.backup(d)                                  # 일관 스냅샷(공용 provider 자격증명 포함)
+d.execute("delete from auth_credentials where provider='anthropic'")  # anthropic 은 계정별로 새로
+d.commit(); s.close(); d.close()
 PY
-  local k v s
-  while IFS=$'\t' read -r k v; do
-    [[ -z "$k" ]] && continue
-    s="$(src_by_key "$k")" || continue
-    drop_provider "$adir" "$(src_provider "$s")"
-  done < <(bindings_for "$name")
-  info "계정 저장소 시드: $adir/agent.db (공용 자격증명 상속, 바인딩된 소스는 계정별)"
+  info "계정 저장소 시드: $adir/agent.db (공용 provider 자격증명 상속, anthropic 은 계정별)"
 }
 
-# 슬롯 → 계정 저장소. 업스트림 공식 임포터 한 번으로 바인딩된 모든 소스를 함께 임포트한다.
-#   바인딩되지 않은 소스의 env 변수는 빈 디렉터리로 눌러 다른 소스가 섞여 들어오지 않게 한다.
-#   슬롯 마커 파일들의 mtime/size 스탬프가 그대로면 재임포트를 생략한다(불필요한 rotation 방지).
+# 슬롯 토큰 ⇄ 계정 agent.db 동기화(최신 우선). stdout 에 email.
+#
+# 왜 "최신 우선"인가: Anthropic 은 refresh 토큰을 매 갱신마다 로테이션하고 직전 토큰을 폐기한다.
+# 슬롯(Claude Code)과 계정 agent.db(gjc)가 같은 refresh 토큰을 복제해 들고 있으면, 먼저 갱신한
+# 쪽이 상대 토큰을 죽인다 → 진 쪽은 invalid_grant 로 로그아웃(Claude Code 는 토큰을 비우고,
+# gjc 는 auth-storage 의 isDefinitiveFailure 경로에서 자격증명 행을 disable).
+# 예전처럼 슬롯을 무조건 agent.db 로 덮어쓰면, gjc 가 방금 로테이션해 얻은 살아있는 토큰을
+# 이미 폐기된 슬롯 토큰으로 되돌려 gjc 까지 같이 죽는다. 그래서 refresh 토큰이 서로 다를 때만
+# expiresAt 이 큰 쪽을 채택한다(양쪽이 같으면 로테이션이 없었다는 뜻이므로 손대지 않는다).
 sync_cred() {
   local name="$1" adir; adir="$(acct_dir "$name")"
-  local binds; binds="$(bindings_for "$name")"
-  [[ -n "$binds" ]] || { err "'$name' 에 바인딩된 슬롯이 없습니다 — gjc-acct sources / gjc-acct bind 참고"; return 1; }
+  has_creds "$name" || { err "'$name' 미인증 — 먼저:  claude-acct $name  (안에서 /login)"; return 1; }
+  local sd; sd="$(slot_dir "$name")"
+  DST_DB="$adir/agent.db" python3 - "$sd/.credentials.json" "$sd/.claude.json" <<'PY'
+import json,os,sqlite3,sys,time
+cred=json.load(open(sys.argv[1])).get("claudeAiOauth") or {}
+meta=(json.load(open(sys.argv[2])).get("oauthAccount") if os.path.exists(sys.argv[2]) else {}) or {}
+access=cred.get("accessToken"); refresh=cred.get("refreshToken"); expires=cred.get("expiresAt")
+email=meta.get("emailAddress") or ""; account=meta.get("accountUuid") or ""
+if not access or not email:
+    sys.stderr.write("자격증명/이메일을 슬롯에서 찾지 못함\n"); sys.exit(2)
+c=sqlite3.connect(os.environ["DST_DB"], timeout=15); c.execute("PRAGMA busy_timeout=15000")
+row=c.execute("select data from auth_credentials where provider='anthropic'").fetchone()
+if row:
+    try: cur=json.loads(row[0])
+    except Exception: cur={}
+    # 같은 refresh 토큰 = 로테이션 없음 → 그대로 둔다(불필요한 재작성 금지).
+    if cur.get("refresh") and cur.get("refresh")==refresh:
+        c.close(); print(cur.get("email") or email); sys.exit(0)
+    # 갈라졌다면 더 최신(= expires 가 큰) 쪽이 살아있는 토큰이다. gjc 쪽이 최신이면 덮지 않는다.
+    if cur.get("access") and (cur.get("expires") or 0) > (expires or 0):
+        sys.stderr.write("계정 저장소 토큰이 슬롯보다 최신 → 덮어쓰지 않음(슬롯은 종료 시 갱신)\n")
+        c.close(); print(cur.get("email") or email); sys.exit(0)
+data=json.dumps({"access":access,"refresh":refresh,"expires":expires,"accountId":account,"email":email})
+ident="email:"+email; now=int(time.time())
+# 격리 저장소엔 anthropic 은 이 계정 하나만 유지
+c.execute("delete from auth_credentials where provider='anthropic'")
+c.execute("insert into auth_credentials(provider,credential_type,data,identity_key,created_at,updated_at) values('anthropic','oauth',?,?,?,?)",(data,ident,now,now))
+c.commit(); c.close()
+print(email)
+PY
+}
 
-  local k v s p stamp_input="" envs=() provs=() authed=0
-  local empty="$adir/.gjc-acct-empty"; mkdir -p "$empty"
-  local -A bound_keys=()
+# 계정 agent.db → 슬롯 .credentials.json 되쓰기(gjc 종료 후). 로테이션 충돌의 반쪽을 막는다.
+# gjc 실행 중 토큰이 로테이션됐다면 슬롯의 사본은 이미 폐기된 상태다. 그대로 두면 다음
+# `claude-acct <name>` 이 죽은 토큰으로 갱신을 시도해 Claude Code 쪽이 로그아웃된다.
+# refresh 토큰이 갈라졌고 agent.db 쪽이 더 최신일 때만 슬롯을 갱신한다(다른 필드는 보존).
+writeback_cred() {
+  local name="$1" adir; adir="$(acct_dir "$name")"
+  [[ -f "$adir/agent.db" ]] || return 0
+  local sd; sd="$(slot_dir "$name")"
+  [[ -d "$sd" ]] || return 0
+  SRC_DB="$adir/agent.db" python3 - "$sd/.credentials.json" <<'PY' || true
+import json,os,sqlite3,sys,tempfile
+path=sys.argv[1]
+try:
+    c=sqlite3.connect(os.environ["SRC_DB"], timeout=15); c.execute("PRAGMA busy_timeout=15000")
+    row=c.execute("select data from auth_credentials where provider='anthropic'").fetchone()
+    c.close()
+except Exception:
+    sys.exit(0)
+if not row: sys.exit(0)
+try: cur=json.loads(row[0])
+except Exception: sys.exit(0)
+if not cur.get("access") or not cur.get("refresh"): sys.exit(0)
+try: doc=json.load(open(path))
+except Exception: doc={}
+if not isinstance(doc, dict): doc={}
+slot=doc.get("claudeAiOauth") or {}
+# 로테이션이 없었으면 되쓸 것이 없다.
+if slot.get("refreshToken")==cur.get("refresh"): sys.exit(0)
+# 슬롯이 더 최신이면(다른 곳에서 갱신됨) 건드리지 않는다.
+if slot.get("accessToken") and (slot.get("expiresAt") or 0) >= (cur.get("expires") or 0): sys.exit(0)
+slot.update({"accessToken":cur["access"],"refreshToken":cur["refresh"],"expiresAt":cur.get("expires")})
+doc["claudeAiOauth"]=slot
+d=os.path.dirname(path) or "."
+fd,tmp=tempfile.mkstemp(dir=d, prefix=".credentials.json.")
+try:
+    with os.fdopen(fd,"w") as f: json.dump(doc,f)
+    os.chmod(tmp,0o600); os.replace(tmp,path)
+except Exception:
+    try: os.unlink(tmp)
+    except Exception: pass
+    sys.exit(0)
+sys.stderr.write("슬롯 토큰 갱신됨(gjc 가 로테이션한 토큰을 되씀): %s\n" % path)
+PY
+}
 
-  while IFS=$'\t' read -r k v; do
-    [[ -z "$k" ]] && continue
-    s="$(src_by_key "$k")" || continue
-    bound_keys["$k"]=1
-    p="$(slot_dir "$s" "$v")"
-    if ! slot_authed "$s" "$v"; then
-      err "슬롯 '$k=$v' 미인증 — 먼저:  $(src_tool "$s") $v  (안에서 로그인)"; continue
-    fi
-    authed=1
-    envs+=("$(src_env "$s")=$(to_native "$p")")
-    provs+=("$(src_provider "$s")")
-    stamp_input+="$k:$(stat -c '%Y %s' "$p/$(src_marker "$s")" 2>/dev/null || stat -f '%m %z' "$p/$(src_marker "$s")" 2>/dev/null || echo '?');"
-  done <<< "$binds"
-
-  [[ "$authed" -eq 1 ]] || { err "'$name' 에 인증된 슬롯이 하나도 없습니다."; return 1; }
-
-  # 바인딩되지 않은 소스는 빈 디렉터리로 차단.
-  for s in "${SOURCES[@]}"; do
-    [[ -n "${bound_keys[$(src_key "$s")]:-}" ]] || envs+=("$(src_env "$s")=$(to_native "$empty")")
-  done
-
-  local stamp="$adir/.gjc-acct-slot-stamp" have_all=1
-  for p in "${provs[@]}"; do has_provider "$adir" "$p" || have_all=0; done
-  if [[ -f "$stamp" && "$stamp_input" == "$(cat "$stamp" 2>/dev/null)" && "$have_all" -eq 1 ]]; then
-    return 0
-  fi
-
-  for p in "${provs[@]}"; do drop_provider "$adir" "$p"; done
-  if ! env GJC_CODING_AGENT_DIR="$(to_native "$adir")" "${envs[@]}" \
-       "$GJC_BIN" setup credentials --yes >/dev/null 2>&1; then
-    err "공식 임포터 실패: gjc setup credentials (계정 '$name')"; return 1
-  fi
-  for p in "${provs[@]}"; do
-    has_provider "$adir" "$p" || { err "임포트 후에도 '$p' 자격증명이 없음: $name"; return 1; }
-  done
-  printf '%s' "$stamp_input" > "$stamp"
+# 계정 저장소에 남아 있는 anthropic 자격증명의 이메일(있으면) 출력.
+store_email() {
+  DB="$1/agent.db" python3 - <<'PY' 2>/dev/null || true
+import json,os,sqlite3
+try:
+    c = sqlite3.connect(os.environ["DB"], timeout=5)
+    row = c.execute("select data from auth_credentials where provider='anthropic'").fetchone()
+    print((json.loads(row[0]).get("email") or "") if row else "")
+except Exception:
+    print("")
+PY
 }
 
 prepare() {
   local name="$1" adir; adir="$(acct_dir "$name")"
   link_shared "$adir"
-  seed_agent_db "$name"
-  sync_cred "$name"
+  mirror_trusted_files "$adir"
+  own_atomic_files "$adir"
+  seed_agent_db "$adir"
+  if sync_cred "$name"; then return 0; fi
+  # 슬롯 토큰이 비었어도 계정 저장소에 anthropic 자격증명이 남아 있으면 그걸로 진행한다.
+  # (저장소 토큰이 유효/갱신 가능하면 그대로 동작. 만료·폐기면 gjc 안에서 /login 으로 이 저장소에 직접 재로그인.)
+  if gjc_anthropic_in "$adir"; then
+    err "경고: '$name' 슬롯 토큰 없음 → 계정 저장소($adir)의 기존 자격증명으로 진행."
+    err "       401/revoked 가 나오면 이 세션 안에서 /login 으로 재로그인하세요(슬롯 없이도 이 저장소에 저장됨)."
+    store_email "$adir"
+    return 0
+  fi
+  return 1
 }
 
-# ── 조회 커맨드 ──────────────────────────────────────────────────────────────
-sources_cmd() {
-  local s slots d
-  for s in "${SOURCES[@]}"; do
-    printf '\033[1m%s\033[0m  (%s)\n' "$(src_key "$s")" "$(src_tool "$s")" >&2
-    printf '  루트     : %s\n' "$(src_root "$s")" >&2
-    printf '  env      : %s\n' "$(src_env "$s")" >&2
-    printf '  마커     : %s\n' "$(src_marker "$s")" >&2
-    printf '  provider : %s\n' "$(src_provider "$s")" >&2
-    slots=""
-    for d in "$(src_root "$s")"/*/; do
-      [[ -d "$d" ]] || continue
-      local n; n="$(basename "$d")"
-      slot_authed "$s" "$n" && slots+="$n✓ " || slots+="$n· "
-    done
-    printf '  슬롯     : %s\n\n' "${slots:-(없음)}" >&2
-  done
-  info "✓=인증됨  ·=미인증.  추가 소스는 GJC_ACCT_EXTRA_SOURCES 로 등록합니다."
+gjc_anthropic_in() {   # 계정 저장소에 anthropic 자격증명 있는지
+  local adir="$1"
+  [[ -f "$adir/agent.db" ]] || return 1
+  DB="$adir/agent.db" python3 - <<'PY' 2>/dev/null
+import os,sqlite3,sys
+try:
+    c=sqlite3.connect(os.environ["DB"], timeout=5)
+    sys.exit(0 if c.execute("select 1 from auth_credentials where provider='anthropic'").fetchone() else 1)
+except Exception: sys.exit(1)
+PY
 }
 
 list_accounts() {
-  printf '%-12s %-22s %-11s %s\n' "ACCOUNT" "SOURCES" "GJC-STORE" "IDENTITY" >&2
-  printf '%-12s %-22s %-11s %s\n' "-------" "-------" "---------" "--------" >&2
-  local name k v s bind_col store provs okall email ident
-  while read -r name; do
-    [[ -z "$name" ]] && continue
-    bind_col=""; provs=(); ident=""
-    while IFS=$'\t' read -r k v; do
-      [[ -z "$k" ]] && continue
-      s="$(src_by_key "$k")" || continue
-      slot_authed "$s" "$v" && bind_col+="$k=$v✓ " || bind_col+="$k=$v· "
-      provs+=("$(src_provider "$s")")
-      email="$(slot_email "$s" "$v")"
-      [[ -n "$email" ]] && ident="${ident:+$ident, }${email:0:3}***@${email#*@}"
-    done < <(bindings_for "$name")
-    [[ -n "$bind_col" ]] || bind_col="(없음)"
-    okall=1; [[ ${#provs[@]} -gt 0 ]] || okall=0
-    for s in "${provs[@]:-}"; do [[ -n "$s" ]] && { has_provider "$(acct_dir "$name")" "$s" || okall=0; }; done
-    [[ "$okall" -eq 1 ]] && store="✓ 격리됨" || store="· 미생성"
-    printf '%-12s %-22s %-11s %s\n' "$name" "$bind_col" "$store" "${ident:-—}" >&2
-  done < <(all_account_names)
+  printf '%-10s %-12s %-12s %s\n' "ACCOUNT" "AUTH" "GJC-STORE" "EMAIL" >&2
+  printf '%-10s %-12s %-12s %s\n' "-------" "----" "---------" "-----" >&2
+  local d name email auth store adir
+  for d in "$CLAUDE_ACCOUNTS"/*/; do
+    [[ -d "$d" ]] || continue
+    name="$(basename "$d")"
+    has_creds "$name" && auth="✓ 인증" || auth="· 미인증"
+    adir="$(acct_dir "$name")"
+    gjc_anthropic_in "$adir" && store="✓ 격리됨" || store="· 미생성"
+    email="$(slot_email "$name")"
+    local masked="—"; [[ -n "$email" ]] && masked="${email:0:3}***@${email#*@}"
+    printf '%-10s %-12s %-12s %s\n' "$name" "$auth" "$store" "$masked" >&2
+  done
 }
 
 status_cmd() {
   local def; def="$(get_default)"
-  printf '%-12s %-8s %-10s %-14s %-14s %s\n' "ACCOUNT" "SOURCE" "SLOT" "SUBSCRIPTION" "RATE-TIER" "FLAGS" >&2
-  printf '%-12s %-8s %-10s %-14s %-14s %s\n' "-------" "------" "----" "------------" "---------" "-----" >&2
-  local name k v s p sub tier flags first
-  while read -r name; do
-    [[ -z "$name" ]] && continue
-    first=1
-    while IFS=$'\t' read -r k v; do
-      [[ -z "$k" ]] && continue
-      s="$(src_by_key "$k")" || continue
-      p="$(slot_dir "$s" "$v")"; sub="—"; tier="—"
-      if [[ "$k" == claude ]]; then
-        sub="$(python3 -c "import json;print((json.load(open('$p/.credentials.json')).get('claudeAiOauth') or {}).get('subscriptionType','—'))" 2>/dev/null || echo —)"
-        tier="$(python3 -c "import json;print((json.load(open('$p/.claude.json')).get('oauthAccount') or {}).get('userRateLimitTier','—'))" 2>/dev/null || echo —)"
-      elif [[ "$k" == codex ]]; then
-        sub="$(python3 -c "import json;print((json.load(open('$p/auth.json')).get('auth_mode') or '—'))" 2>/dev/null || echo —)"
-      fi
-      flags=""; [[ "$name" == "$def" && "$first" -eq 1 ]] && flags="★기본"
-      slot_authed "$s" "$v" || flags="${flags:+$flags }미인증"
-      printf '%-12s %-8s %-10s %-14s %-14s %s\n' "$([[ $first -eq 1 ]] && printf '%s' "$name")" "$k" "$v" "${sub:-—}" "${tier:-—}" "$flags" >&2
-      first=0
-    done < <(bindings_for "$name")
-  done < <(all_account_names)
+  printf '%-10s %-10s %-14s %-16s %s\n' "ACCOUNT" "AUTH/STORE" "SUBSCRIPTION" "RATE-TIER" "FLAGS" >&2
+  printf '%-10s %-10s %-14s %-16s %s\n' "-------" "----------" "------------" "---------" "-----" >&2
+  local d name
+  for d in "$CLAUDE_ACCOUNTS"/*/; do
+    [[ -d "$d" ]] || continue
+    name="$(basename "$d")"
+    local auth store sub tier flags
+    has_creds "$name" && auth="✓" || auth="·"
+    gjc_anthropic_in "$(acct_dir "$name")" && store="✓" || store="·"
+    sub="$(python3 -c "import json;print((json.load(open('$d/.credentials.json')).get('claudeAiOauth') or {}).get('subscriptionType','—'))" 2>/dev/null || echo —)"
+    tier="$(python3 -c "import json;print((json.load(open('$d/.claude.json')).get('oauthAccount') or {}).get('userRateLimitTier','—'))" 2>/dev/null || echo —)"
+    flags=""; [[ "$name" == "$def" ]] && flags="★기본"
+    printf '%-10s %-10s %-14s %-16s %s\n' "$name" "$auth/$store" "${sub:-—}" "${tier:-—}" "$flags" >&2
+  done
   info "※ 실시간 잔여 한도는 실행 후 gjc 안에서 /usage 또는  gjc stats  로 확인(계정별 저장소라 각각 집계)."
 }
 
@@ -468,62 +485,88 @@ default_cmd() {
   local name="${1:-}"
   if [[ -z "$name" ]]; then
     local dfl; dfl="$(get_default)"
-    [[ -n "$dfl" ]] && account_exists "$dfl" && info "기본 계정: $dfl" || info "기본 계정 미설정 (gjc-acct default <name>)"
+    [[ -n "$dfl" && -d "$(slot_dir "$dfl")" ]] && info "기본 계정: $dfl" || info "기본 계정 미설정 (gjc-acct default <name>)"
     return
   fi
   if [[ "$name" == "-" || "$name" == clear || "$name" == none ]]; then rm -f "$DEFAULT_FILE"; ok "기본 계정 해제"; return; fi
-  valid_name "$name"; account_exists "$name" || { err "없는 계정: $name"; exit 1; }
+  valid_name "$name"; [[ -d "$(slot_dir "$name")" ]] || { err "없는 계정: $name"; exit 1; }
   mkdir -p "$ACCT_ROOT"; printf '%s\n' "$name" > "$DEFAULT_FILE"; ok "기본 계정 설정: $name"
 }
 
 launch() {
   local name="$1"; shift || true
   valid_name "$name"
-  account_exists "$name" || {
-    err "없는 계정: $name"
-    err "  슬롯을 먼저 만들거나(claude-acct add $name / codex-acct add $name),"
-    err "  이미 있는 슬롯을 묶으십시오:  gjc-acct bind $name claude=<slot> codex=<slot>"
-    exit 1
-  }
-  prepare "$name" || exit 1
-  local adir adir_native ident
-  adir="$(acct_dir "$name")"; adir_native="$(to_native "$adir")"; ident="$(account_identity "$name")"
+  [[ -d "$(slot_dir "$name")" ]] || { err "없는 계정: $name (claude-acct add $name 로 먼저 생성/로그인)"; exit 1; }
+  local email; email="$(prepare "$name")" || exit 1
+  local adir; adir="$(acct_dir "$name")"
+  local adir_native; adir_native="$(to_native "$adir")"
+  # gjc 가 실행 중 refresh 토큰을 로테이션했을 수 있으므로 종료(정상/중단 무관) 시 슬롯으로 되쓴다.
+  # exec 를 쓰면 이 훅이 돌지 않는다 → 자식으로 실행하고 종료코드를 그대로 전파한다.
+  trap 'writeback_cred "$name"' EXIT
+  local rc=0
   if should_inject_sessiondir "$@"; then
+    # 세션 오픈 실행이면 --session-dir 를 공유 경로로 주입(계정 간 세션 공유, 크로스플랫폼).
     local sdir; sdir="$(session_dir_for_cwd)"
+    migrate_legacy_acct_session_dir "$sdir"
     mkdir -p "$sdir" 2>/dev/null || true
-    info "▶ gjc 실행: 계정 '$name' ($ident)  [store=$adir, sessions=$sdir(공유)]"
-    exec env GJC_CODING_AGENT_DIR="$adir_native" GJC_ACCT_ACTIVE="$name" "$GJC_BIN" --session-dir "$(to_native "$sdir")" "$@"
+    info "▶ gjc 실행: 계정 '$name' ($email)  [store=$adir, sessions=$sdir(공유)]"
+    env GJC_CODING_AGENT_DIR="$adir_native" GJC_ACCT_ACTIVE="$name" "$GJC_BIN" --session-dir "$(to_native "$sdir")" "$@" || rc=$?
+  else
+    info "▶ gjc 실행: 계정 '$name' ($email)  [store=$adir]"
+    env GJC_CODING_AGENT_DIR="$adir_native" GJC_ACCT_ACTIVE="$name" "$GJC_BIN" "$@" || rc=$?
   fi
-  info "▶ gjc 실행: 계정 '$name' ($ident)  [store=$adir]"
-  exec env GJC_CODING_AGENT_DIR="$adir_native" GJC_ACCT_ACTIVE="$name" "$GJC_BIN" "$@"
+  writeback_cred "$name"
+  trap - EXIT
+  exit "$rc"
 }
 
 pick_and_launch() {
-  local names=() n
-  while read -r n; do [[ -n "$n" ]] && names+=("$n"); done < <(all_account_names)
-  [[ "${#names[@]}" -gt 0 ]] || { err "계정 없음 — claude-acct add <name> 또는 codex-acct add <name> 로 슬롯을 먼저 만드십시오."; exit 1; }
+  local names=() d choice
+  for d in "$CLAUDE_ACCOUNTS"/*/; do [[ -d "$d" ]] && names+=("$(basename "$d")"); done
+  [[ "${#names[@]}" -gt 0 ]] || { err "계정 없음 — claude-acct add <name> 로 먼저 추가/로그인."; exit 1; }
   info "실행할 계정을 고르세요:"
-  local i=1
+  local i=1 n
   for n in "${names[@]}"; do
-    printf '  %d) %-12s %s\n' "$i" "$n" "$(bindings_for "$n" | tr '\t' '=' | tr '\n' ' ')" >&2
+    has_creds "$n" && printf '  %d) %s  (✓ 인증)\n' "$i" "$n" >&2 || printf '  %d) %s  (· 미인증)\n' "$i" "$n" >&2
     ((i++))
   done
   printf '번호 선택: ' >&2; read -r choice
   [[ "$choice" =~ ^[0-9]+$ ]] && (( choice>=1 && choice<=${#names[@]} )) || { err "잘못된 선택."; exit 1; }
-  launch "${names[$((choice-1))]}"
+  launch "${names[$((choice-1))]}" "$@"
+}
+
+# 래퍼 모드(argv0 == gjc): 인자를 계정 이름으로 해석하지 않고 그대로 전달한다.
+#   1) 이미 계정 컨텍스트 안(GJC_ACCT_ACTIVE 또는 GJC_CODING_AGENT_DIR 설정됨) -> 실 gjc 로 그대로 exec.
+#      gjc 가 자신을 다시 부를 때 토큰 동기화/되쓰기를 재진입하지 않게 하는 가드다.
+#   2) 기본 계정이 있으면 그 계정으로 launch.
+#   3) 기본 계정이 없고 tty 면 대화형 선택, 아니면(파이프/-p) base 저장소로 그냥 실행한다.
+#      무인 실행을 선택 프롬프트로 죽이지 않는 것이 이 분기의 전부다.
+wrapper_main() {
+  if [[ -n "${GJC_ACCT_ACTIVE:-}" || -n "${GJC_CODING_AGENT_DIR:-}" ]]; then
+    exec "$GJC_BIN" "$@"
+  fi
+  local dfl; dfl="$(get_default)"
+  if [[ -n "$dfl" && -d "$(slot_dir "$dfl")" ]]; then
+    launch "$dfl" "$@"
+    return
+  fi
+  if [[ -t 0 && -t 2 ]]; then
+    pick_and_launch "$@"
+  else
+    info "기본 계정 미설정 - base 저장소($BASE_AGENT)로 실행한다. 계정 라우팅은:  gjc-acct default <name>"
+    exec "$GJC_BIN" "$@"
+  fi
 }
 
 completion_cmd() {
   case "${1:-bash}" in
     bash) cat <<'BASH'
 _gjc_acct() {
-  local cur subs accts root
+  local cur subs base accts
   cur="${COMP_WORDS[COMP_CWORD]}"
-  subs="list ls status sources bind unbind sync reseed default dir completion help"
-  accts=""
-  for root in "${CLAUDE_ACCOUNTS_DIR:-$HOME/.claude-accounts}" "${CODEX_ACCOUNTS_DIR:-$HOME/.codex-accounts}" "${GJC_ACCOUNTS_DIR:-$HOME/.gjc-accounts}"; do
-    [[ -d "$root" ]] && accts+="$(cd "$root" && for d in */; do [[ -d "$d" ]] && printf '%s ' "${d%/}"; done)"
-  done
+  subs="list ls status sync reseed default dir completion help"
+  base="${CLAUDE_ACCOUNTS_DIR:-$HOME/.claude-accounts}"
+  accts="$(cd "$base" 2>/dev/null && for d in */; do [[ -d "$d" ]] && printf '%s ' "${d%/}"; done)"
   if [[ $COMP_CWORD -eq 1 ]]; then COMPREPLY=( $(compgen -W "$subs $accts" -- "$cur") ); else COMPREPLY=( $(compgen -W "$accts" -- "$cur") ); fi
 }
 complete -F _gjc_acct gjc-acct
@@ -531,12 +574,10 @@ BASH
     ;;
     zsh) cat <<'ZSH'
 _gjc_acct() {
+  local base="${CLAUDE_ACCOUNTS_DIR:-$HOME/.claude-accounts}"
   local -a subs accts
-  local root
-  subs=(list ls status sources bind unbind sync reseed default dir completion help)
-  for root in "${CLAUDE_ACCOUNTS_DIR:-$HOME/.claude-accounts}" "${CODEX_ACCOUNTS_DIR:-$HOME/.codex-accounts}" "${GJC_ACCOUNTS_DIR:-$HOME/.gjc-accounts}"; do
-    [[ -d "$root" ]] && accts+=(${(f)"$(cd "$root" && for d in */; do [[ -d "$d" ]] && echo "${d%/}"; done)"})
-  done
+  subs=(list ls status sync writeback reseed default dir completion help)
+  [[ -d "$base" ]] && accts=(${(f)"$(cd "$base" && for d in */; do [[ -d "$d" ]] && echo "${d%/}"; done)"})
   if (( CURRENT == 2 )); then compadd -- $subs $accts; else compadd -- $accts; fi
 }
 compdef _gjc_acct gjc-acct
@@ -548,23 +589,24 @@ ZSH
 
 main() {
   mkdir -p "$ACCT_ROOT"; chmod 700 "$ACCT_ROOT" 2>/dev/null || true
+  if (( WRAPPER_MODE )); then wrapper_main "$@"; return; fi
   if [[ $# -eq 0 ]]; then
     local dfl; dfl="$(get_default)"
-    if [[ -n "$dfl" ]] && account_exists "$dfl"; then launch "$dfl"; else pick_and_launch; fi
+    if [[ -n "$dfl" && -d "$(slot_dir "$dfl")" ]]; then launch "$dfl"; else pick_and_launch; fi
     return
   fi
   case "$1" in
     list|ls)    list_accounts ;;
     status)     status_cmd ;;
-    sources)    sources_cmd ;;
-    bind)       shift; bind_cmd "$@" ;;
-    unbind)     shift; unbind_cmd "${1:-}" "${2:-}" ;;
     sync)       shift; [[ -n "${1:-}" ]] || { err "사용법: gjc-acct sync <name>"; exit 1; }
-                valid_name "$1"; link_shared "$(acct_dir "$1")"; seed_agent_db "$1"
-                sync_cred "$1" && ok "동기화됨: $1 → $(acct_dir "$1")/agent.db ($(account_identity "$1"))";;
+                valid_name "$1"; link_shared "$(acct_dir "$1")"; mirror_trusted_files "$(acct_dir "$1")"; own_atomic_files "$(acct_dir "$1")"
+                seed_agent_db "$(acct_dir "$1")"
+                e="$(sync_cred "$1")" && ok "동기화됨: $1 → $(acct_dir "$1")/agent.db (email:$e)";;
+    writeback)  shift; [[ -n "${1:-}" ]] || { err "사용법: gjc-acct writeback <name>"; exit 1; }
+                valid_name "$1"; writeback_cred "$1"; ok "되쓰기 검사 완료: $1";;
     reseed)     shift; [[ -n "${1:-}" ]] || { err "사용법: gjc-acct reseed <name>"; exit 1; }
-                valid_name "$1"; rm -f "$(acct_dir "$1")/agent.db" "$(acct_dir "$1")"/agent.db-* "$(acct_dir "$1")/.gjc-acct-slot-stamp"
-                prepare "$1" && ok "재시드 완료: $1";;
+                valid_name "$1"; rm -f "$(acct_dir "$1")/agent.db" "$(acct_dir "$1")"/agent.db-*
+                prepare "$1" >/dev/null && ok "재시드 완료: $1";;
     default)    shift; default_cmd "${1:-}" ;;
     dir)        shift; [[ -n "${1:-}" ]] || { err "사용법: gjc-acct dir <name>"; exit 1; }; acct_dir "$1" ;;
     completion) shift; completion_cmd "${1:-bash}" ;;
