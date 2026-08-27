@@ -194,7 +194,7 @@ gjc-acct completion bash|zsh  셸 자동완성 스크립트 출력
 | `CODEX_ACCOUNTS_DIR` | `~/.codex-accounts` | `codex-acct` 슬롯 위치 |
 | `GJC_ACCT_EXTRA_SOURCES` | (미설정) | 추가 소스 `key\|루트\|env\|마커\|provider\|도구` (`;` 구분) |
 | `GJC_ACCT_SESSIONS_ROOT` | `<base>/sessions` | 공유 세션 루트 |
-| `GJC_ACCT_BIN` | `gjc` | 실행할 gjc 바이너리 |
+| `GJC_ACCT_BIN` | (자동 탐지) | 실행할 gjc 바이너리를 명시 지정(버전 비교 없이 그대로 사용) |
 | `GJC_ACCT_NO_SESSION_SHARE` | (미설정) | `1` 이면 `--session-dir` 주입을 끄고 gjc 기본 관리형 스코프 사용 |
 
 ---

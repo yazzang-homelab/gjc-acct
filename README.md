@@ -196,7 +196,7 @@ gjc-acct completion bash|zsh  print shell completion
 | `CODEX_ACCOUNTS_DIR` | `~/.codex-accounts` | `codex-acct` slot root |
 | `GJC_ACCT_EXTRA_SOURCES` | unset | Extra `key|root|env|marker|provider|tool` definitions, separated by `;` |
 | `GJC_ACCT_SESSIONS_ROOT` | `<base>/sessions` | Shared session root |
-| `GJC_ACCT_BIN` | `gjc` | gjc executable |
+| `GJC_ACCT_BIN` | auto-detected | Pin the gjc executable (used as-is, skipping version comparison) |
 | `GJC_ACCT_NO_SESSION_SHARE` | unset | Set to `1` to keep gjc's managed per-account session scope |
 
 ---
