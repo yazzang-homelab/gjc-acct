@@ -241,22 +241,90 @@ should_inject_sessiondir() {
 }
 
 # ── 계정 저장소 ──────────────────────────────────────────────────────────────
+# gjc 가 원자적 교체(임시파일+rename)로 다시 쓰는 파일은 심링크로 공유할 수 없다.
+# applyAtomicYamlPatches 는 심링크를 따라가지 않고 그 경로를 실파일로 갈아치우므로,
+# 첫 설정 변경에서 심링크가 사라지고 계정별 실파일로 갈라진다. 공유를 유지하는 척하다
+# 조용히 갈라지는 대신, 이런 파일은 애초에 계정별 실파일로 두고 없을 때만 base 에서 시드한다.
+ATOMIC_OWNED_FILES=(config.yml settings.json)
+
+# 심링크로 두면 gjc 가 아예 못 읽는 파일: agent/.env 는 utils/env.ts 의 readTrustedAgentEnv()
+# 가 lstat().isFile() + O_NOFOLLOW 로 열기 때문에 심링크면 status=unavailable 이 되고,
+# $rotatingCredentialEnv() 가 그 파일이 소유한 이름(CLAUDE_TOKEN_*·CODEX_TOKEN_*)을
+# 무조건 undefined 로 만든다 → models.yml 의 apiKeyEnv 프로바이더가 통째로 사라진다.
+# 매 호출마다 base 내용을 실파일로 미러링한다.
+TRUSTED_REAL_FILES=(.env)
+
+mirror_trusted_files() {
+  local adir="$1" name dst src
+  for name in "${TRUSTED_REAL_FILES[@]}"; do
+    dst="$adir/$name"; src="$BASE_AGENT/$name"
+    [[ -f "$src" ]] || continue
+    [[ -L "$dst" ]] && rm -f "$dst"
+    if ! cmp -s "$src" "$dst" 2>/dev/null; then
+      cp -p "$src" "$dst.tmp.$$" && chmod 600 "$dst.tmp.$$" && mv -f "$dst.tmp.$$" "$dst"
+    fi
+    chmod 600 "$dst" 2>/dev/null || true
+  done
+}
+
+# 계정이 소유하는 설정 파일 보장: 없으면 base 에서 복사, 심링크면 그 내용을 실파일로 고정.
+# 이미 갈라진 실파일은 절대 건드리지 않는다(그 안에 계정별 모델·알림 설정이 들어 있다).
+own_atomic_files() {
+  local adir="$1" name dst src
+  for name in "${ATOMIC_OWNED_FILES[@]}"; do
+    dst="$adir/$name"; src="$BASE_AGENT/$name"
+    if [[ -L "$dst" ]]; then
+      local target; target="$(readlink -f "$dst" 2>/dev/null || true)"
+      if [[ -f "$target" ]]; then cp -p "$target" "$dst.tmp.$$" && mv -f "$dst.tmp.$$" "$dst"
+      else rm -f "$dst"; fi
+    elif [[ ! -e "$dst" && -f "$src" ]]; then
+      cp -p "$src" "$dst"
+    fi
+  done
+}
+
 # base 의 항목을 계정 저장소로 심링크(격리 대상은 제외).
 link_shared() {
   local adir="$1" f name dst
   mkdir -p "$adir"; chmod 700 "$adir" 2>/dev/null || true
   mkdir -p "$SHARED_SESSIONS_ROOT" 2>/dev/null || true
+  # 이전 버전이 만든 sessions/terminal-sessions 심링크가 남아 있으면 제거(이제 --session-dir 사용).
+  # resident-cache 도 심링크로 두면 안 된다: gjc 의 blob-store 는 이 루트를 lstat 으로
+  # 검증해 심링크면 ResidentCacheTrustError(directory_untrusted) 로 실패한다(리다이렉트/TOCTOU 방어).
+  # 쓰기 경로는 메모리로 강등되지만 fork/setSessionFile/restoreState 는 하드 실패한다.
+  # 애초에 인스턴스 디렉터리는 PID 리스로 소유되는 프로세스 로컬 캐시라 공유 이득이 없다.
+  # .gjc-recovery 도 같은 이유로 실디렉터리여야 한다: 네이티브 RecoveryFsRoot 는 관리
+  # 세션 스코프를 retain 할 때 이 저널 루트가 심링크면 reparse_point 를 던지고, TS 층이
+  # 이를 binding_invalid: prepare:retained_authority 로 감싸 비대화(-p) 실행이 통째로 크래시한다.
+  # sdk 도 같은 부류다: 네이티브 RetainedPublication::open 은 agent_dir/sdk ·
+  # sdk/broker.lock · sdk/broker.lock/owner.json · sdk/broker.json 을 전부 O_NOFOLLOW 로
+  # 열어 신원을 확인하므로, sdk 가 심링크면 napi 가 GenericFailure
+  # "Retained broker publication authority is unavailable." 를 던지고 브로커 기동이 uncaught 로 죽는다.
   local sd
-  for sd in sessions terminal-sessions; do
+  for sd in sessions terminal-sessions resident-cache .gjc-recovery sdk; do
     [[ -L "$adir/$sd" ]] && rm -f "$adir/$sd"
   done
+  mkdir -p "$adir/sdk" 2>/dev/null || true
+  chmod 700 "$adir/sdk" 2>/dev/null || true
+  mkdir -p "$adir/resident-cache" 2>/dev/null || true
+  chmod 700 "$adir/resident-cache" 2>/dev/null || true
+  mkdir -p "$adir/.gjc-recovery" 2>/dev/null || true
+  chmod 700 "$adir/.gjc-recovery" 2>/dev/null || true
   for f in "$BASE_AGENT"/* "$BASE_AGENT"/.[!.]*; do
     [[ -e "$f" ]] || continue
     name="$(basename "$f")"
     case "$name" in
       agent.db|agent.db-*|models.db|models.db-*|*-shm|*-wal|*.lock|credential-auto-import-state.json) continue ;;
-      sessions|terminal-sessions) continue ;;
+      sessions|terminal-sessions|resident-cache|.gjc-recovery|sdk) continue ;;
+      .env) continue ;;   # mirror_trusted_files() 가 실파일로 미러링(심링크면 gjc 가 못 읽는다)
     esac
+    # gjc 가 원자적으로 갈아치우는 설정 파일은 계정 소유다. 심링크로 덮으면 첫 쓰기에서
+    # 어차피 풀리고, 아래 병합 분기가 이미 갈라진 계정 설정을 rm -rf 로 날려 base 로 되돌린다.
+    local owned=0 owned_name
+    for owned_name in "${ATOMIC_OWNED_FILES[@]}"; do
+      [[ "$name" == "$owned_name" ]] && owned=1
+    done
+    (( owned )) && continue
     dst="$adir/$name"
     if [[ -L "$dst" ]]; then
       [[ "$(readlink -f "$dst" 2>/dev/null)" == "$(readlink -f "$f" 2>/dev/null)" ]] && continue
@@ -389,6 +457,8 @@ sync_cred() {
 prepare() {
   local name="$1" adir; adir="$(acct_dir "$name")"
   link_shared "$adir"
+  mirror_trusted_files "$adir"
+  own_atomic_files "$adir"
   seed_agent_db "$name"
   sync_cred "$name"
 }
@@ -560,7 +630,8 @@ main() {
     bind)       shift; bind_cmd "$@" ;;
     unbind)     shift; unbind_cmd "${1:-}" "${2:-}" ;;
     sync)       shift; [[ -n "${1:-}" ]] || { err "사용법: gjc-acct sync <name>"; exit 1; }
-                valid_name "$1"; link_shared "$(acct_dir "$1")"; seed_agent_db "$1"
+                valid_name "$1"; link_shared "$(acct_dir "$1")"
+                mirror_trusted_files "$(acct_dir "$1")"; own_atomic_files "$(acct_dir "$1")"; seed_agent_db "$1"
                 sync_cred "$1" && ok "동기화됨: $1 → $(acct_dir "$1")/agent.db ($(account_identity "$1"))";;
     reseed)     shift; [[ -n "${1:-}" ]] || { err "사용법: gjc-acct reseed <name>"; exit 1; }
                 valid_name "$1"; rm -f "$(acct_dir "$1")/agent.db" "$(acct_dir "$1")"/agent.db-* "$(acct_dir "$1")/.gjc-acct-slot-stamp"
