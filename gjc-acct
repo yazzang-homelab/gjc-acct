@@ -32,7 +32,15 @@
 #   gjc-acct reseed <name>        계정 저장소를 base 기준으로 재시드
 #   gjc-acct default [name]       무인자 실행 시 쓸 기본 계정 조회/설정
 #   gjc-acct dir <name>           계정 저장소 경로 출력
+#   gjc-acct gc [--dry-run]       아무 gjc 도 쓰지 않는 계정별 SDK 브로커 데몬 정리
 #   gjc-acct completion bash|zsh  셸 자동완성 스크립트 출력
+#
+# SDK 브로커 수명:
+#   대화형 gjc 는 turn 마다 ensureBroker() 로 계정 agent dir 당 하나씩 `gjc sdk broker-internal`
+#   데몬을 detached+unref 로 띄우고, 브로커 자체에는 유휴 종료가 없다(0.16.0 기준). 계정을
+#   격리하면 브로커가 계정 수만큼 곱해져 각 150~200MB 를 영구 점유한다. 그래서 launch 는
+#   gjc 종료 뒤 같은 agent dir 을 쓰는 다른 gjc 가 없으면 그 브로커에 broker.shutdown 을 보낸다.
+#   GJC_ACCT_KEEP_BROKER=1 이면 종료하지 않고 예전처럼 exec 한다.
 #
 set -euo pipefail
 
@@ -232,7 +240,7 @@ should_inject_sessiondir() {
     case "$a" in
       --session-dir|--session-dir=*|--no-session) return 1 ;;
       -*) continue ;;
-      session|state|harness|coordinator|team|ultragoal|ralplan|deep-interview|skills|config|stats|notify|daemon|mcp|mcp-serve|contribute-pr|migrate|rlm|update|plugin|web-search|q|codex-native-hook|gc|setup|completion)
+      session|state|harness|coordinator|team|ultragoal|ralplan|deep-interview|skills|config|stats|notify|daemon|mcp|mcp-serve|contribute-pr|migrate|rlm|update|plugin|web-search|q|codex-native-hook|gc|setup|completion|sdk)
         return 1 ;;
       *) return 0 ;;
     esac
@@ -454,6 +462,106 @@ sync_cred() {
   printf '%s' "$stamp_input" > "$stamp"
 }
 
+# ── SDK 브로커 수명 관리 ─────────────────────────────────────────────────────
+#   broker.json 은 브로커가 발행한 { pid, url, token, ... } (sdk/broker/discovery.ts).
+#   종료는 업스트림이 열어 둔 인증 loopback 채널의 `broker.shutdown` 요청으로 한다
+#   (scripts/restart-sdk-broker-core.ts 와 같은 경로). 채널이 안 되면 cmdline 으로 신원을
+#   확인한 뒤 SIGTERM — commands/sdk.ts 가 SIGTERM 을 graceful stop 으로 처리한다.
+broker_json_of() { printf '%s/sdk/broker.json' "$1"; }
+
+broker_pid_of() {
+  local j; j="$(broker_json_of "$1")"
+  [[ -f "$j" ]] || return 1
+  python3 - "$j" <<'PY' 2>/dev/null
+import json,sys
+try: print(int(json.load(open(sys.argv[1]))["pid"]))
+except Exception: sys.exit(1)
+PY
+}
+
+# pid 가 이 agent dir 의 broker-internal 프로세스인지 (재사용된 pid 오살 방지).
+broker_pid_matches() {
+  local pid="$1" adir="$2" cmd
+  [[ -r "/proc/$pid/cmdline" ]] || return 1
+  cmd="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null)"
+  [[ "$cmd" == *"sdk broker-internal"* && "$cmd" == *"--agent-dir $adir"* ]]
+}
+
+# 이 agent dir 로 돌고 있는 gjc 프로세스(브로커 제외) pid 목록.
+#   GJC_CODING_AGENT_DIR 은 env 로만 전달되므로 /proc/<pid>/environ 을 본다. 미설정이면 base.
+#   environ 을 읽을 수 없는 프로세스(타 사용자)는 보수적으로 "사용 중" 으로 친다.
+#   /proc 이 없는 OS(macOS)에서는 신원 확인이 불가능하므로 아무 브로커도 건드리지 않는다(무해).
+agent_dir_users() {
+  local adir="$1" p cmd e
+  for p in $(pgrep -x gjc 2>/dev/null); do
+    cmd="$(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null)" || continue
+    [[ "$cmd" == *"sdk broker-internal"* ]] && continue
+    if [[ ! -r "/proc/$p/environ" ]]; then printf '%s\n' "$p"; continue; fi
+    e="$(tr '\0' '\n' < "/proc/$p/environ" 2>/dev/null | grep -m1 '^GJC_CODING_AGENT_DIR=' | cut -d= -f2-)"
+    [[ "${e:-$BASE_AGENT}" == "$adir" ]] && printf '%s\n' "$p"
+  done
+  return 0
+}
+
+# WebSocket 클라이언트는 bun(gjc 의 런타임이라 거의 항상 있다) 또는 node ≥20 로 실행.
+broker_request_shutdown() {
+  local j="$1" runner=()
+  if command -v bun >/dev/null 2>&1; then runner=(bun run -)
+  elif command -v node >/dev/null 2>&1; then runner=(node --experimental-websocket --no-warnings -)
+  else return 1; fi
+  timeout 8 "${runner[@]}" "$j" <<'JS' >/dev/null 2>&1
+const d = JSON.parse(require("node:fs").readFileSync(process.argv[2], "utf8"));
+const ws = new WebSocket(`${d.url}?token=${encodeURIComponent(d.token)}`);
+setTimeout(() => process.exit(2), 6000);
+ws.onopen = () => ws.send(JSON.stringify({ type: "broker_request", id: "gjc-acct-shutdown", operation: "broker.shutdown", input: {} }));
+ws.onmessage = (e) => { const m = JSON.parse(e.data); if (m.type === "broker_response") { try { ws.close(); } catch {} process.exit(m.ok ? 0 : 1); } };
+ws.onerror = () => process.exit(3);
+JS
+}
+
+# 브로커 종료. 반환 0=종료함, 1=브로커 없음, 2=실패.
+broker_stop() {
+  local adir="$1" pid j i
+  pid="$(broker_pid_of "$adir")" || return 1
+  broker_pid_matches "$pid" "$adir" || return 1
+  j="$(broker_json_of "$adir")"
+  broker_request_shutdown "$j" || true
+  for i in 1 2 3 4 5 6 7 8 9 10; do [[ -d "/proc/$pid" ]] || return 0; sleep 0.2; done
+  broker_pid_matches "$pid" "$adir" && kill -TERM "$pid" 2>/dev/null
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do [[ -d "/proc/$pid" ]] || return 0; sleep 0.2; done
+  return 2
+}
+
+# 사용자가 없을 때만 종료. 반환 0=종료함, 1=브로커 없음, 3=사용 중, 2=실패.
+broker_reap_if_idle() {
+  local adir="$1" pid users
+  pid="$(broker_pid_of "$adir")" || return 1
+  broker_pid_matches "$pid" "$adir" || return 1
+  users="$(agent_dir_users "$adir")"
+  [[ -z "$users" ]] || return 3
+  broker_stop "$adir"
+}
+
+gc_cmd() {
+  local dry=0 a; [[ "${1:-}" == "--dry-run" || "${1:-}" == "-n" ]] && dry=1
+  local dirs=("$BASE_AGENT") d
+  for d in "$ACCT_ROOT"/*/agent; do [[ -d "$d" ]] && dirs+=("$d"); done
+  local pid users label rc reaped=0 kept=0
+  for a in "${dirs[@]}"; do
+    pid="$(broker_pid_of "$a")" || continue
+    broker_pid_matches "$pid" "$a" || continue
+    label="$([[ "$a" == "$BASE_AGENT" ]] && printf base || basename "$(dirname "$a")")"
+    users="$(agent_dir_users "$a" | tr '\n' ' ')"
+    if [[ -n "$users" ]]; then
+      info "유지  $label  broker=$pid  사용중 gjc: $users"; kept=$((kept+1)); continue
+    fi
+    if (( dry )); then info "정리대상  $label  broker=$pid"; reaped=$((reaped+1)); continue; fi
+    if broker_stop "$a"; then ok "종료  $label  broker=$pid"; reaped=$((reaped+1))
+    else err "실패  $label  broker=$pid"; fi
+  done
+  info "브로커 정리: $((dry ? 0 : reaped))개 종료$([[ $dry -eq 1 ]] && printf ' (dry-run 대상 %d개)' "$reaped"), ${kept}개 유지"
+}
+
 prepare() {
   local name="$1" adir; adir="$(acct_dir "$name")"
   link_shared "$adir"
@@ -558,14 +666,24 @@ launch() {
   prepare "$name" || exit 1
   local adir adir_native ident
   adir="$(acct_dir "$name")"; adir_native="$(to_native "$adir")"; ident="$(account_identity "$name")"
+  local gjc_args=()
   if should_inject_sessiondir "$@"; then
     local sdir; sdir="$(session_dir_for_cwd)"
     mkdir -p "$sdir" 2>/dev/null || true
     info "▶ gjc 실행: 계정 '$name' ($ident)  [store=$adir, sessions=$sdir(공유)]"
-    exec env GJC_CODING_AGENT_DIR="$adir_native" GJC_ACCT_ACTIVE="$name" "$GJC_BIN" --session-dir "$(to_native "$sdir")" "$@"
+    gjc_args=(--session-dir "$(to_native "$sdir")")
+  else
+    info "▶ gjc 실행: 계정 '$name' ($ident)  [store=$adir]"
   fi
-  info "▶ gjc 실행: 계정 '$name' ($ident)  [store=$adir]"
-  exec env GJC_CODING_AGENT_DIR="$adir_native" GJC_ACCT_ACTIVE="$name" "$GJC_BIN" "$@"
+  if [[ -n "${GJC_ACCT_KEEP_BROKER:-}" ]]; then
+    exec env GJC_CODING_AGENT_DIR="$adir_native" GJC_ACCT_ACTIVE="$name" "$GJC_BIN" "${gjc_args[@]}" "$@"
+  fi
+  # exec 하지 않고 자식으로 돌린 뒤, 이 계정 브로커를 아무도 안 쓰면 거둔다.
+  # gjc 가 포그라운드 프로세스 그룹을 갖고 있어 Ctrl-C 등 TTY 신호는 gjc 가 처리한다.
+  local rc=0
+  env GJC_CODING_AGENT_DIR="$adir_native" GJC_ACCT_ACTIVE="$name" "$GJC_BIN" "${gjc_args[@]}" "$@" || rc=$?
+  broker_reap_if_idle "$adir" >/dev/null 2>&1 || true
+  exit "$rc"
 }
 
 pick_and_launch() {
@@ -589,7 +707,7 @@ completion_cmd() {
 _gjc_acct() {
   local cur subs accts root
   cur="${COMP_WORDS[COMP_CWORD]}"
-  subs="list ls status sources bind unbind sync reseed default dir completion help"
+  subs="list ls status sources bind unbind sync reseed default dir gc completion help"
   accts=""
   for root in "${CLAUDE_ACCOUNTS_DIR:-$HOME/.claude-accounts}" "${CODEX_ACCOUNTS_DIR:-$HOME/.codex-accounts}" "${GJC_ACCOUNTS_DIR:-$HOME/.gjc-accounts}"; do
     [[ -d "$root" ]] && accts+="$(cd "$root" && for d in */; do [[ -d "$d" ]] && printf '%s ' "${d%/}"; done)"
@@ -603,7 +721,7 @@ BASH
 _gjc_acct() {
   local -a subs accts
   local root
-  subs=(list ls status sources bind unbind sync reseed default dir completion help)
+  subs=(list ls status sources bind unbind sync reseed default dir gc completion help)
   for root in "${CLAUDE_ACCOUNTS_DIR:-$HOME/.claude-accounts}" "${CODEX_ACCOUNTS_DIR:-$HOME/.codex-accounts}" "${GJC_ACCOUNTS_DIR:-$HOME/.gjc-accounts}"; do
     [[ -d "$root" ]] && accts+=(${(f)"$(cd "$root" && for d in */; do [[ -d "$d" ]] && echo "${d%/}"; done)"})
   done
@@ -638,6 +756,7 @@ main() {
                 prepare "$1" && ok "재시드 완료: $1";;
     default)    shift; default_cmd "${1:-}" ;;
     dir)        shift; [[ -n "${1:-}" ]] || { err "사용법: gjc-acct dir <name>"; exit 1; }; acct_dir "$1" ;;
+    gc)         shift; gc_cmd "${1:-}" ;;
     completion) shift; completion_cmd "${1:-bash}" ;;
     -h|--help|help) awk 'NR>1 && /^#/{sub(/^# ?/,""); print > "/dev/stderr"; next} NR>1{exit}' "$0" ;;
     *)          launch "$@" ;;

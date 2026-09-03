@@ -140,6 +140,28 @@ reparse point 를 정당하게 거부하기 때문입니다(위 설계 원칙 �
 > 알고 쓰십시오. 관리형 스코프를 그대로 쓰려면 `GJC_ACCT_NO_SESSION_SHARE=1` 로 주입을 끄면 됩니다
 > (계정별로 세션이 분리됩니다).
 
+### SDK 브로커 수명
+
+대화형 gjc 는 매 turn 마다 `ensureBroker()` 를 호출하고, 자기 agent 디렉터리에 브로커가 없으면
+`gjc sdk broker-internal` 데몬을 detached 로 띄우고 손을 놓습니다. 이 브로커에는 유휴 종료가 없습니다
+(gjc 0.16.0 `sdk/broker/*` 기준 확인). 인증된 `broker.shutdown` 요청이나 `SIGTERM` 으로만 내려갑니다.
+계정별 저장소를 쓰면 이 데몬이 사용한 계정 수만큼 곱해지고, 하나에 150~200MB 를 무기한 점유합니다.
+8GB 호스트에서 계정 9개를 돌린 결과 커널 OOM 킬러가 동작했습니다.
+
+그래서 곱셈을 만든 `gjc-acct` 가 브로커 수명도 책임집니다:
+
+- `gjc-acct <name> ...` 은 gjc 를 `exec` 하지 않고 자식으로 실행합니다. gjc 가 종료되고 같은 계정
+  저장소를 쓰는 다른 gjc 가 없으면 브로커의 인증 loopback 채널로 `broker.shutdown` 을 보내고
+  (업스트림 `scripts/restart-sdk-broker.ts` 와 같은 경로), 안 되면 신원 확인 후 `SIGTERM` 을 보냅니다.
+  gjc 의 종료 코드는 그대로 전달됩니다.
+- `gjc-acct gc [--dry-run]` 은 base 와 모든 계정 저장소를 돌며 살아 있는 gjc 가 쓰지 않는 브로커를
+  종료합니다. ssh 가 끊기거나 런처가 죽어 고아가 된 브로커는 cron 이나 systemd 타이밸로 이것을 돌려 회수하세요.
+- `GJC_ACCT_KEEP_BROKER=1` 이면 예전처럼 `exec` 하고 브로커도 그대로 둡니다.
+
+사용 여부는 `/proc/<pid>/environ` 의 `GJC_CODING_AGENT_DIR` 로 판별하며, 환경을 읽을 수 없는 프로세스는
+사용 중으로 간주합니다. `/proc` 이 없는 OS 에서는 어떤 브로커도 건드리지 않습니다. 종료 요청에는 `bun`
+(gjc 자체 런타임) 또는 `node` 20+ 가 필요합니다.
+
 ---
 
 ## 설치
@@ -181,6 +203,7 @@ gjc-acct sync <name>          슬롯 토큰을 해당 계정 저장소로 동기
 gjc-acct reseed <name>        계정 저장소를 base 기준으로 재시드
 gjc-acct default [name]       무인자 실행 시 쓸 기본 계정 조회/설정
 gjc-acct dir <name>           계정 저장소 경로 출력
+gjc-acct gc [--dry-run]       아무 gjc 도 쓰지 않는 계정별 SDK 브로커 데몬 정리
 gjc-acct completion bash|zsh  셸 자동완성 스크립트 출력
 ```
 
@@ -196,6 +219,7 @@ gjc-acct completion bash|zsh  셸 자동완성 스크립트 출력
 | `GJC_ACCT_SESSIONS_ROOT` | `<base>/sessions` | 공유 세션 루트 |
 | `GJC_ACCT_BIN` | `gjc` | 실행할 gjc 바이너리 |
 | `GJC_ACCT_NO_SESSION_SHARE` | (미설정) | `1` 이면 `--session-dir` 주입을 끄고 gjc 기본 관리형 스코프 사용 |
+| `GJC_ACCT_KEEP_BROKER` | (미설정) | `1` 이면 gjc 를 `exec` 하고 종료 후 계정 SDK 브로커를 그대로 둠 |
 
 ---
 

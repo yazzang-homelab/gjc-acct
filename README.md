@@ -142,6 +142,32 @@ explicit `--session-dir <shared-path>` override.
 > scope's ACL and no-follow validation. Set `GJC_ACCT_NO_SESSION_SHARE=1` to retain gjc's
 > managed per-account session scope instead.
 
+### SDK broker lifetime
+
+Every interactive gjc session calls `ensureBroker()` on each turn and, when none is running
+for its agent directory, starts a detached `gjc sdk broker-internal` daemon. The broker has no
+idle shutdown of its own (verified against gjc 0.16.0 `sdk/broker/*`); it only stops on an
+authenticated `broker.shutdown` request or `SIGTERM`. With per-account stores this multiplies
+the daemons by the number of accounts you have used, each holding roughly 150-200 MB
+indefinitely. On an 8 GB host with nine accounts this was enough to trigger the kernel OOM
+killer.
+
+`gjc-acct` therefore owns the broker lifetime it caused:
+
+- `gjc-acct <name> ...` runs gjc as a child instead of `exec`. When gjc exits and no other
+  gjc process is using the same account store, the launcher sends `broker.shutdown` over the
+  broker's authenticated loopback channel (the same path upstream's
+  `scripts/restart-sdk-broker.ts` uses) and falls back to an identity-checked `SIGTERM`.
+  gjc's exit code is passed through unchanged.
+- `gjc-acct gc [--dry-run]` sweeps the base store and every account store and stops brokers
+  that no live gjc process is using. Run it from a cron job or systemd timer to recover
+  brokers orphaned by a dropped SSH session or a crashed launcher.
+- `GJC_ACCT_KEEP_BROKER=1` restores the old `exec` behaviour and leaves brokers running.
+
+Usage detection reads `GJC_CODING_AGENT_DIR` from `/proc/<pid>/environ`; a process whose
+environment cannot be read is treated as a user. On systems without `/proc` no broker is
+touched. The shutdown request needs `bun` (gjc's own runtime) or `node` 20+.
+
 ---
 
 ## Install
@@ -183,6 +209,7 @@ gjc-acct sync <name>          import slot credentials without launching gjc
 gjc-acct reseed <name>        rebuild an account store from the base
 gjc-acct default [name]       get or set the default account
 gjc-acct dir <name>           print the account-store path
+gjc-acct gc [--dry-run]       stop per-account SDK broker daemons no gjc process is using
 gjc-acct completion bash|zsh  print shell completion
 ```
 
@@ -198,6 +225,7 @@ gjc-acct completion bash|zsh  print shell completion
 | `GJC_ACCT_SESSIONS_ROOT` | `<base>/sessions` | Shared session root |
 | `GJC_ACCT_BIN` | `gjc` | gjc executable |
 | `GJC_ACCT_NO_SESSION_SHARE` | unset | Set to `1` to keep gjc's managed per-account session scope |
+| `GJC_ACCT_KEEP_BROKER` | unset | Set to `1` to `exec` gjc and leave the account's SDK broker running afterwards |
 
 ---
 
